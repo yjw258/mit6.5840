@@ -3,11 +3,12 @@ package kvsrv
 import "6.5840/labrpc"
 import "crypto/rand"
 import "math/big"
-
+import "time"
 
 type Clerk struct {
 	server *labrpc.ClientEnd
 	// You will have to modify this struct.
+
 }
 
 func nrand() int64 {
@@ -35,8 +36,16 @@ func MakeClerk(server *labrpc.ClientEnd) *Clerk {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
-
+	args := GetArgs{Key: key}
+	reply := GetReply{}
 	// You will have to modify this function.
+	for {
+		ok := ck.server.Call("KVServer.Get", &args, &reply)
+		if ok {
+			return reply.Value
+		}
+		time.Sleep(time.Second)
+	}
 	return ""
 }
 
@@ -50,6 +59,16 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) string {
 	// You will have to modify this function.
+	id := nrand()
+	args := PutAppendArgs{Key: key, Value: value, ID: id}
+	reply := PutAppendReply{}
+	for {
+		ok := ck.server.Call("KVServer."+op, &args, &reply)
+		if ok {
+			return reply.Value
+		}
+		time.Sleep(time.Second)
+	}
 	return ""
 }
 
