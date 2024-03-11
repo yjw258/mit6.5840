@@ -80,12 +80,12 @@ type Raft struct {
 	lastAppendTime time.Time
 
 	// Volatile state on all servers
-	commitIndex int
-	lastApplied int
+	commitIndex int // index of highest log entry known to be committed
+	lastApplied int // index of highest log entry applied to state machine
 
 	// Volatile state on leaders
-	nextIndex  []int
-	matchIndex []int
+	nextIndex  []int // for each server, index of the next log entry to send to that server
+	matchIndex []int // for each server, index of highest log entry known to be replicated on server
 }
 
 // return currentTerm and whether this server
@@ -100,6 +100,30 @@ func (rf *Raft) GetState() (int, bool) {
 	term = rf.currentTerm
 	isleader = rf.role == LEADER
 	return term, isleader
+}
+
+func (rf *Raft) getLastLogIndex() int {
+	return len(rf.logs) - 1
+}
+
+func (rf *Raft) getLastLogTerm() int {
+	return rf.logs[rf.getLastLogIndex()].Term
+}
+
+func (rf *Raft) becomeLeader() {
+	rf.role = LEADER
+	// reinitialize nextIndex and matchIndex
+	for i := 0; i < len(rf.peers); i++ {
+		rf.nextIndex[i] = len(rf.logs)
+		rf.matchIndex[i] = 0
+	}
+	go rf.sendHeartBeat()
+}
+
+func (rf *Raft) becomeFollower(term int) {
+	rf.currentTerm = term
+	rf.role = FOLLOWER
+	rf.votedFor = -1
 }
 
 // save Raft's persistent state to stable storage,
@@ -173,9 +197,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.role = FOLLOWER
-		rf.votedFor = -1
+		rf.becomeFollower(args.Term)
 	}
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
@@ -243,9 +265,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term = rf.currentTerm
 		reply.Success = false
 	} else if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.role = FOLLOWER
-		rf.votedFor = -1
+		rf.becomeFollower(args.Term)
 	}
 	rf.lastAppendTime = time.Now()
 }
@@ -273,6 +293,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.role != LEADER {
+		isLeader = false
+	}
+	// If command received from client: append entry to local log, respond after entry applied to state machine
 
 	return index, term, isLeader
 }
@@ -297,41 +323,30 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) sendHeartBeat() {
-	for !rf.killed() {
-		rf.mu.Lock()
-		if rf.role != LEADER {
-			rf.mu.Unlock()
-			return
-		}
-		rf.mu.Unlock()
-		for i := 0; i < len(rf.peers); i++ {
-			if i != rf.me {
-				go func(server int) {
+	for i := 0; i < len(rf.peers); i++ {
+		if i != rf.me {
+			go func(server int) {
+				rf.mu.Lock()
+				args := &AppendEntriesArgs{
+					Term:         rf.currentTerm,
+					LeaderId:     rf.me,
+					PrevLogIndex: -1,
+					PrevLogTerm:  -1,
+					Entries:      nil,
+					LeaderCommit: rf.commitIndex,
+				}
+				rf.mu.Unlock()
+				reply := &AppendEntriesReply{}
+				if rf.sendAppendEntries(server, args, reply) {
 					rf.mu.Lock()
-					args := &AppendEntriesArgs{
-						Term:         rf.currentTerm,
-						LeaderId:     rf.me,
-						PrevLogIndex: -1,
-						PrevLogTerm:  -1,
-						Entries:      nil,
-						LeaderCommit: rf.commitIndex,
+					if reply.Term > rf.currentTerm {
+						rf.becomeFollower(reply.Term)
 					}
 					rf.mu.Unlock()
-					reply := &AppendEntriesReply{}
-					if rf.sendAppendEntries(server, args, reply) {
-						rf.mu.Lock()
-						if reply.Term > rf.currentTerm {
-							rf.currentTerm = reply.Term
-							rf.role = FOLLOWER
-							rf.votedFor = -1
-						}
-						rf.mu.Unlock()
-						// DPrintf("Server %d received reply from server %d, term: %d, success: %t", rf.me, server, reply.Term, reply.Success)
-					}
-				}(i)
-			}
+					// DPrintf("Server %d received reply from server %d, term: %d, success: %t", rf.me, server, reply.Term, reply.Success)
+				}
+			}(i)
 		}
-		time.Sleep(150 * time.Millisecond)
 	}
 }
 
@@ -368,14 +383,11 @@ func (rf *Raft) elec() {
 						// If votes received from majority of servers: become leader
 						if *voteCount == len(rf.peers)/2+1 && rf.role == CANDIDATE {
 							DPrintf("Server %d became leader", rf.me)
-							rf.role = LEADER
-							go rf.sendHeartBeat()
+							rf.becomeLeader()
 						}
 					} else {
 						if reply.Term > rf.currentTerm {
-							rf.currentTerm = reply.Term
-							rf.role = FOLLOWER
-							rf.votedFor = -1
+							rf.becomeFollower(reply.Term)
 						}
 					}
 					rf.mu.Unlock()
@@ -387,12 +399,23 @@ func (rf *Raft) elec() {
 
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
-		electionTimeout := 300 + (rand.Int63() % 200)
+		electionTimeout := 500 + (rand.Int63() % 200)
 		// Your code here (2A)
 		// Check if a leader election should be started.
 		rf.mu.Lock()
-		if rf.role != LEADER && time.Since(rf.lastAppendTime) > time.Duration(electionTimeout)*time.Millisecond {
-			go rf.elec()
+		switch rf.role {
+		case FOLLOWER:
+			fallthrough
+		case CANDIDATE:
+			// If election timeout elapses without receiving AppendEntries RPC from current leader or granting vote to candidate: convert to candidate
+			if time.Since(rf.lastAppendTime) > time.Duration(electionTimeout)*time.Millisecond {
+				go rf.elec()
+			}
+		case LEADER:
+			// Send heartbeats to all servers to maintain authority
+			if time.Since(rf.lastAppendTime) > 150*time.Millisecond {
+				go rf.sendHeartBeat()
+			}
 		}
 		rf.mu.Unlock()
 		// pause for a random amount of time between 50 and 350
