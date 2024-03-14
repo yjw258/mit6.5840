@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 	"math/rand"
+	// "sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -78,7 +79,7 @@ type Raft struct {
 	logs           []LogEntry
 	role           int32
 	lastAppendTime time.Time
-
+	applyCh        chan ApplyMsg
 	// Volatile state on all servers
 	commitIndex int // index of highest log entry known to be committed
 	lastApplied int // index of highest log entry applied to state machine
@@ -86,6 +87,13 @@ type Raft struct {
 	// Volatile state on leaders
 	nextIndex  []int // for each server, index of the next log entry to send to that server
 	matchIndex []int // for each server, index of highest log entry known to be replicated on server
+}
+
+func min(x, y int) int {
+	if x < y {
+		return x
+	}
+	return y
 }
 
 // return currentTerm and whether this server
@@ -202,7 +210,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
-	} else if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+	} else if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && (args.LastLogTerm > rf.getLastLogTerm() || (args.LastLogTerm == rf.getLastLogTerm() && args.LastLogIndex >= rf.getLastLogIndex())) {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
 	} else {
@@ -261,13 +269,31 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.Success = true
+	reply.Term = rf.currentTerm
+	// Reply false if term < currentTerm
 	if args.Term < rf.currentTerm {
-		reply.Term = rf.currentTerm
 		reply.Success = false
-	} else if args.Term > rf.currentTerm {
+		return
+	} else {
 		rf.becomeFollower(args.Term)
+		rf.lastAppendTime = time.Now()
 	}
-	rf.lastAppendTime = time.Now()
+
+	if args.PrevLogIndex > rf.getLastLogIndex() || rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		return
+	} else {
+		rf.logs = rf.logs[:args.PrevLogIndex+1]
+	}
+
+	// Append any new entries not already in the log
+	if args.Entries != nil {
+		rf.logs = append(rf.logs, args.Entries...)
+	}
+	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommit, rf.getLastLogIndex())
+	}
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -294,11 +320,19 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	if rf.role != LEADER {
 		isLeader = false
+		rf.mu.Unlock()
+		return index, term, isLeader
 	}
+
 	// If command received from client: append entry to local log, respond after entry applied to state machine
+	rf.logs = append(rf.logs, LogEntry{Term: rf.currentTerm, Command: command})
+	index = rf.getLastLogIndex()
+	term = rf.currentTerm
+	rf.mu.Unlock()
+
+	// replicate log entries to followers
 
 	return index, term, isLeader
 }
@@ -325,15 +359,23 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) sendHeartBeat() {
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
+			rf.mu.Lock()
+			currentTerm := rf.currentTerm
+			leaderLd := rf.me
+			nextIndex := rf.nextIndex[i]
+			prevLogIndex := nextIndex - 1
+			prevLogTerm := rf.logs[prevLogIndex].Term
+			leaderCommit := rf.commitIndex
+			rf.mu.Unlock()
 			go func(server int) {
 				rf.mu.Lock()
 				args := &AppendEntriesArgs{
-					Term:         rf.currentTerm,
-					LeaderId:     rf.me,
-					PrevLogIndex: -1,
-					PrevLogTerm:  -1,
+					Term:         currentTerm,
+					LeaderId:     leaderLd,
+					PrevLogIndex: nextIndex - 1,
+					PrevLogTerm:  prevLogTerm,
 					Entries:      nil,
-					LeaderCommit: rf.commitIndex,
+					LeaderCommit: leaderCommit,
 				}
 				rf.mu.Unlock()
 				reply := &AppendEntriesReply{}
@@ -345,6 +387,7 @@ func (rf *Raft) sendHeartBeat() {
 					rf.mu.Unlock()
 					// DPrintf("Server %d received reply from server %d, term: %d, success: %t", rf.me, server, reply.Term, reply.Success)
 				}
+
 			}(i)
 		}
 	}
@@ -370,8 +413,8 @@ func (rf *Raft) elec() {
 				args := &RequestVoteArgs{
 					Term:         rf.currentTerm,
 					CandidateId:  rf.me,
-					LastLogIndex: -1,
-					LastLogTerm:  -1,
+					LastLogIndex: rf.getLastLogIndex(),
+					LastLogTerm:  rf.getLastLogTerm(),
 				}
 				rf.mu.Unlock()
 				reply := &RequestVoteReply{}
@@ -398,7 +441,7 @@ func (rf *Raft) elec() {
 }
 
 func (rf *Raft) ticker() {
-	for rf.killed() == false {
+	for !rf.killed() {
 		electionTimeout := 500 + (rand.Int63() % 200)
 		// Your code here (2A)
 		// Check if a leader election should be started.
@@ -422,6 +465,114 @@ func (rf *Raft) ticker() {
 		// milliseconds.
 		ms := 50 + (rand.Int63() % 300)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
+	}
+}
+
+// apply log entries to state machine
+func (rf *Raft) applyer() {
+	for !rf.killed() {
+		rf.mu.Lock()
+		for rf.commitIndex > rf.lastApplied {
+			rf.lastApplied++
+			// apply log[rf.lastApplied] to state machine
+			rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.logs[rf.lastApplied].Command, CommandIndex: rf.lastApplied}
+		}
+		rf.mu.Unlock()
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// send log entries to followers
+func (rf *Raft) replicaLogEntriesToFollowers() {
+	for !rf.killed() {
+		_, isLeader := rf.GetState()
+		if isLeader {
+			for i := 0; i < len(rf.peers); i++ {
+				rf.mu.Lock()
+				lastLogIndex := rf.getLastLogIndex()
+				nextIndex := rf.nextIndex[i]
+				rf.mu.Unlock()
+
+				if i != rf.me && nextIndex <= lastLogIndex {
+					go func(server int) {
+						rf.mu.Lock()
+						args := &AppendEntriesArgs{
+							Term:         rf.currentTerm,
+							LeaderId:     rf.me,
+							PrevLogIndex: rf.nextIndex[server] - 1,
+							PrevLogTerm:  rf.logs[rf.nextIndex[server]-1].Term,
+							// Entries:      entries,
+							LeaderCommit: rf.commitIndex,
+						}
+						args.Entries = make([]LogEntry, len(rf.logs[nextIndex:]))
+						copy(args.Entries, rf.logs[nextIndex:])
+						rf.mu.Unlock()
+						reply := &AppendEntriesReply{}
+						if rf.sendAppendEntries(server, args, reply) {
+							if reply.Term > args.Term {
+								return
+							}
+							rf.mu.Lock()
+							if reply.Term > rf.currentTerm {
+								rf.becomeFollower(reply.Term)
+								rf.mu.Unlock()
+								return
+							}
+							rf.mu.Unlock()
+							if reply.Success {
+								rf.mu.Lock()
+								// update nextIndex and matchIndex for follower
+								rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+								rf.nextIndex[server] = rf.matchIndex[server] + 1
+
+								// If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N
+								N := rf.commitIndex
+								for i := rf.commitIndex + 1; i <= lastLogIndex; i++ {
+									count := 1
+									for j := 0; j < len(rf.peers); j++ {
+										if j != rf.me && rf.matchIndex[j] >= i {
+											count++
+										}
+									}
+									if count > len(rf.peers)/2 && rf.logs[i].Term == rf.currentTerm {
+										N = i
+									}
+								}
+								if N > rf.commitIndex {
+									rf.commitIndex = N
+								}
+
+								rf.mu.Unlock()
+								return
+							} else if reply.Term <= args.Term {
+								rf.mu.Lock()
+								rf.nextIndex[server] = args.PrevLogIndex
+								args.PrevLogIndex = rf.nextIndex[server] - 1
+								args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
+								args.Entries = make([]LogEntry, len(rf.logs[rf.nextIndex[server]:]))
+								copy(args.Entries, rf.logs[rf.nextIndex[server]:])
+								rf.mu.Unlock()
+								// } else if reply.ConflictEntryTerm > 0 {
+								// 	rf.mu.Lock()
+								// 	for i := args.PrevLogIndex; i >= 0; i-- {
+								// 		if rf.logs[i].Term == reply.ConflictEntryTerm {
+								// 			rf.nextIndex[server] = i + 1
+								// 			break
+								// 		}
+								// 	}
+								// 	args.PrevLogIndex = rf.nextIndex[server] - 1
+								// 	args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
+								// 	args.Entries = make([]LogEntry, len(rf.logs[rf.nextIndex[server]:]))
+								// 	copy(args.Entries, rf.logs[rf.nextIndex[server]:])
+								// 	rf.mu.Unlock()
+							}
+						}
+					}(i)
+				}
+
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -450,8 +601,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		logs:           make([]LogEntry, 1),
 		nextIndex:      make([]int, len(peers)),
 		matchIndex:     make([]int, len(peers)),
+		applyCh:        applyCh,
 	}
-
+	rf.logs[0] = LogEntry{Term: 0, Command: nil}
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash
@@ -459,6 +611,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+
+	go rf.replicaLogEntriesToFollowers()
+	// start commiter goroutine to commit log entries
+	go rf.applyer()
 
 	return rf
 }
