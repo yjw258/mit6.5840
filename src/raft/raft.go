@@ -77,9 +77,7 @@ type Raft struct {
 	currentTerm    int
 	votedFor       int
 	logs           []LogEntry
-	role           int32
-	lastCommTime time.Time
-	applyCh        chan ApplyMsg
+	
 	// Volatile state on all servers
 	commitIndex int // index of highest log entry known to be committed
 	lastApplied int // index of highest log entry applied to state machine
@@ -87,6 +85,11 @@ type Raft struct {
 	// Volatile state on leaders
 	nextIndex  []int // for each server, index of the next log entry to send to that server
 	matchIndex []int // for each server, index of highest log entry known to be replicated on server
+
+	// Other state
+	role           int32
+	lastCommTime time.Time
+	applyCh        chan ApplyMsg
 }
 
 func min(x, y int) int {
@@ -125,7 +128,7 @@ func (rf *Raft) becomeLeader() {
 		rf.nextIndex[i] = len(rf.logs)
 		rf.matchIndex[i] = 0
 	}
-	go rf.replicaLogEntriesToFollowers()
+	go rf.heartBeat()
 }
 
 func (rf *Raft) becomeFollower(term int) {
@@ -266,6 +269,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	XTerm 	int
+	XIndex 	int
+	Xlen 	int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -273,6 +279,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	reply.Success = true
 	reply.Term = rf.currentTerm
+	reply.XTerm = -1
+	reply.XIndex = -1
+	reply.Xlen = 0
 	DPrintf("Server %d received AppendEntries from server %d, term: %d, prevLogIndex: %d, prevLogTerm: %d, entries: %v, leaderCommit: %d", rf.me, args.LeaderId, args.Term, args.PrevLogIndex, args.PrevLogTerm, args.Entries, args.LeaderCommit)
 	
 	// Reply false if term < currentTerm
@@ -285,8 +294,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.lastCommTime = time.Now()
 	}
 
-	if args.PrevLogIndex > rf.getLastLogIndex() || rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if args.PrevLogIndex > rf.getLastLogIndex() {
 		reply.Success = false
+		reply.Xlen = rf.getLastLogIndex() + 1
+		DPrintf("Server %d received AppendEntries from server %d, logs don't match, return", rf.me, args.LeaderId)
+		return
+	} else if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		reply.XTerm = rf.logs[args.PrevLogIndex].Term
+
+		// find the first index of the term
+		for i := args.PrevLogIndex - 1; i >= 0; i-- {
+			if rf.logs[i].Term != reply.XTerm {
+				reply.XIndex = i + 1
+				break
+			}
+		}
+		reply.Xlen = rf.getLastLogIndex() + 1
 		DPrintf("Server %d received AppendEntries from server %d, logs don't match, return", rf.me, args.LeaderId)
 		return
 	}
@@ -354,8 +378,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	DPrintf("Server %d logs: %v", rf.me, rf.logs)
 	index = rf.getLastLogIndex()
 	term = rf.currentTerm
-
-	// replicate log entries to followers
 
 	return index, term, isLeader
 }
@@ -464,83 +486,98 @@ func (rf *Raft) applyer() {
 }
 
 // send log entries to followers
-func (rf *Raft) replicaLogEntriesToFollowers() {
+func (rf *Raft) heartBeat() {
 	for !rf.killed() {
-		_, isLeader := rf.GetState()
-		if !isLeader {
-			return
-		} else {
-			rf.mu.Lock()
-			currentTerm := rf.currentTerm
-			leaderLd := rf.me
-			commitIndex := rf.commitIndex
+		rf.mu.Lock()
+		if rf.role != LEADER {
 			rf.mu.Unlock()
-
-			// send log entries to followers
-			for i := 0; i < len(rf.peers); i++ {
-				rf.mu.Lock()
-				if i != rf.me && rf.role == LEADER{
-					go func(server int, currentTerm int, leaderLd int, commitIndex int) {
-						rf.mu.Lock()
-						args := &AppendEntriesArgs{
-							Term:         currentTerm,
-							LeaderId:     leaderLd,
-							PrevLogIndex: rf.nextIndex[server] - 1,
-							PrevLogTerm:  rf.logs[rf.nextIndex[server]-1].Term,
-							LeaderCommit: commitIndex,
-						}
-						if rf.nextIndex[server] <= rf.getLastLogIndex() {
-							args.Entries = make([]LogEntry, len(rf.logs[rf.nextIndex[server]:]))
-							copy(args.Entries, rf.logs[rf.nextIndex[server]:])
-						} else {
-							args.Entries = nil
-						}
-						rf.mu.Unlock()
-						reply := &AppendEntriesReply{}
-						if rf.sendAppendEntries(server, args, reply) {
-							rf.mu.Lock()
-							if reply.Term > args.Term {
-								rf.becomeFollower(reply.Term)
-								rf.mu.Unlock()
-								return
-							}
-							
-							if reply.Success {
-								// update nextIndex and matchIndex for follower
-								rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
-								rf.nextIndex[server] = rf.matchIndex[server] + 1
-
-								// If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N
-								N := rf.commitIndex
-								for i := rf.commitIndex + 1; i <= rf.getLastLogIndex(); i++ {
-									count := 1
-									for j := 0; j < len(rf.peers); j++ {
-										if j != rf.me && rf.matchIndex[j] >= i {
-											count++
-										}
-									}
-									if count > len(rf.peers)/2 && rf.logs[i].Term == rf.currentTerm {
-										N = i
-									}
-								}
-								if N > rf.commitIndex {
-									DPrintf("Server(leader) %d updates commitIndex from %d to %d", rf.me, rf.commitIndex, N)
-									rf.commitIndex = N
-								}
-
-								rf.mu.Unlock()
-								return
-							} else if reply.Term <= args.Term {
-								rf.nextIndex[server] = args.PrevLogIndex
-								rf.mu.Unlock()
-							}
-							
-						}
-					}(i, currentTerm, leaderLd, commitIndex)
-				}
-				rf.mu.Unlock()
-			}
+			return
 		}
+		currentTerm := rf.currentTerm
+		leaderLd := rf.me
+		commitIndex := rf.commitIndex
+		rf.mu.Unlock()
+		
+		// send log entries to followers
+		for i := 0; i < len(rf.peers); i++ {
+			rf.mu.Lock()
+			if i != rf.me && rf.role == LEADER{
+				go func(server int, currentTerm int, leaderLd int, commitIndex int) {
+					rf.mu.Lock()
+					args := &AppendEntriesArgs{
+						Term:         currentTerm,
+						LeaderId:     leaderLd,
+						PrevLogIndex: rf.nextIndex[server] - 1,
+						PrevLogTerm:  rf.logs[rf.nextIndex[server]-1].Term,
+						LeaderCommit: commitIndex,
+					}
+					if rf.nextIndex[server] <= rf.getLastLogIndex() {
+						args.Entries = make([]LogEntry, len(rf.logs[rf.nextIndex[server]:]))
+						copy(args.Entries, rf.logs[rf.nextIndex[server]:])
+					} else {
+						args.Entries = nil
+					}
+					rf.mu.Unlock()
+					reply := &AppendEntriesReply{}
+					if rf.sendAppendEntries(server, args, reply) {
+						rf.mu.Lock()
+						if reply.Term > args.Term {
+							rf.becomeFollower(reply.Term)
+							rf.mu.Unlock()
+							return
+						}
+						
+						if reply.Success {
+							// update nextIndex and matchIndex for follower
+							rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+							rf.nextIndex[server] = rf.matchIndex[server] + 1
+
+							// If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N
+							N := rf.commitIndex
+							for i := rf.commitIndex + 1; i <= rf.getLastLogIndex(); i++ {
+								count := 1
+								for j := 0; j < len(rf.peers); j++ {
+									if j != rf.me && rf.matchIndex[j] >= i {
+										count++
+									}
+								}
+								if count > len(rf.peers)/2 && rf.logs[i].Term == rf.currentTerm {
+									N = i
+								}
+							}
+							if N > rf.commitIndex {
+								DPrintf("Server(leader) %d updates commitIndex from %d to %d", rf.me, rf.commitIndex, N)
+								rf.commitIndex = N
+							}
+
+							rf.mu.Unlock()
+							return
+						} else if reply.Xlen > 0{
+							if reply.XTerm == -1 {
+							// follower's log is too short
+								rf.nextIndex[server] = reply.Xlen
+							} else if rf.logs[reply.XIndex].Term == reply.XTerm {
+							// leader has XTerm in its log, find the last index of XTerm
+								for i := reply.XIndex + 1; i < len(rf.logs); i++ {
+									if rf.logs[i].Term != reply.XTerm {
+										rf.nextIndex[server] = i - 1
+										break
+									}
+								}
+							} else {
+							// leader doesn't have XTerm in its log
+								rf.nextIndex[server] = reply.XIndex
+							}
+							// rf.nextIndex[server] = args.PrevLogIndex
+							rf.mu.Unlock()
+						}
+						
+					}
+				}(i, currentTerm, leaderLd, commitIndex)
+			}
+			rf.mu.Unlock()
+		}
+		
 		time.Sleep(50 * time.Millisecond)
 	}
 }
