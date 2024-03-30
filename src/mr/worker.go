@@ -76,39 +76,6 @@ func Worker(mapf func(string, string) []KeyValue,
 			}
 		}
 	}
-
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
-
-}
-
-//
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
-
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
-	}
 }
 
 //
@@ -136,13 +103,9 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 
 // require a task from coordinator
 func RequireTask() *Task {
-
 	args := ExampleArgs{}
-
 	reply := Task{}
-
 	call("Coordinator.AssignTasks", &args, &reply)
-
 	return &reply
 }
 
@@ -162,9 +125,7 @@ func ExecuteMapTask(mapf func(string, string) []KeyValue, task *Task) {
 	file.Close()
 
 	kva := mapf(filename, string(content))
-
 	reduceNum := task.ReduceNum
-
 	HashedKV := make([][]KeyValue, reduceNum)
 
 	for _, kv := range kva {
@@ -244,8 +205,6 @@ func ExecuteReduceTask(reducef func(string, []string) string, task *Task) {
 // notice coordinator the task is done
 func TaskIsDone(task *Task) {
 	args := task
-
 	reply := ExampleReply{}
-
 	call("Coordinator.TaskIsDone", &args, &reply)
 }

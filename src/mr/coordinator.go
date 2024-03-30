@@ -116,16 +116,6 @@ func (c *Coordinator) TaskIsDone(args *Task, reply *ExampleReply) error {
 }
 
 //
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
-	reply.Y = args.X + 1
-	return nil
-}
-
-//
 // start a thread that listens for RPCs from worker.go
 //
 func (c *Coordinator) server() {
@@ -265,7 +255,7 @@ func (c *Coordinator) CrashHandler() {
 			break
 		}
 		for _, task := range c.TaskMap {
-			if task.TaskStatus == Doing && time.Now().Sub(task.StartTime) > time.Second*5 {
+			if task.TaskStatus == Doing && time.Since(task.StartTime) > time.Second*10 {
 				// fmt.Printf("task %d crashed\n", task.TaskId)
 				task.TaskStatus = Waiting
 				if task.TaskType == MapTask {
