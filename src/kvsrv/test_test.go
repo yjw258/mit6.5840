@@ -488,7 +488,7 @@ func TestMemPutMany(t *testing.T) {
 
 	for i := 0; i < NCLIENT; i++ {
 		cks[i].Put("k", v)
-	}
+ 	}
 
 	runtime.GC()
 	time.Sleep(1 * time.Second)

@@ -19,8 +19,7 @@ type KVServer struct {
 
 	// Your definitions here.
 	KVPairs   map[string]string
-	PutIDs    map[int64]bool
-	AppendIDs map[int64]string
+	PutAppendIDs map[int64]string
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -34,11 +33,12 @@ func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	_, ok := kv.PutIDs[args.ID]
+	_, ok := kv.PutAppendIDs[args.ID]
 	if ok {
 		return
 	}
-	kv.PutIDs[args.ID] = true
+	delete(kv.PutAppendIDs, args.LastOkOperationID)
+	kv.PutAppendIDs[args.ID] = ""
 	kv.KVPairs[args.Key] = args.Value
 }
 
@@ -46,13 +46,14 @@ func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	t, ok := kv.AppendIDs[args.ID]
+	t, ok := kv.PutAppendIDs[args.ID]
 	if ok {
 		reply.Value = t
 		return
 	}
+	delete(kv.PutAppendIDs, args.LastOkOperationID)
 	oldValue := kv.KVPairs[args.Key]
-	kv.AppendIDs[args.ID] = oldValue
+	kv.PutAppendIDs[args.ID] = oldValue
 	kv.KVPairs[args.Key] += args.Value
 	reply.Value = oldValue
 }
@@ -62,7 +63,6 @@ func StartKVServer() *KVServer {
 
 	// You may need initialization code here.
 	kv.KVPairs = make(map[string]string)
-	kv.PutIDs = make(map[int64]bool)
-	kv.AppendIDs = make(map[int64]string)
+	kv.PutAppendIDs = make(map[int64]string)
 	return kv
 }
