@@ -46,7 +46,7 @@ const (
 // CommandValid to true to indicate that the ApplyMsg contains a newly
 // committed log entry.
 //
-// in part 2D you'll want to send other kinds of messages (e.g.,
+// in part 3D you'll want to send other kinds of messages (e.g.,
 // snapshots) on the applyCh, but set CommandValid to false for these
 // other uses.
 type ApplyMsg struct {
@@ -54,7 +54,7 @@ type ApplyMsg struct {
 	Command      interface{}
 	CommandIndex int
 
-	// For 2D:
+	// For 3D:
 	SnapshotValid bool
 	Snapshot      []byte
 	SnapshotTerm  int
@@ -69,7 +69,7 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
-	// Your data here (2A, 2B, 2C).
+	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
@@ -112,7 +112,7 @@ func (rf *Raft) GetState() (int, bool) {
 
 	var term int
 	var isleader bool
-	// Your code here (2A).
+	// Your code here (3A).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	term = rf.currentTerm
@@ -155,7 +155,7 @@ func (rf *Raft) becomeFollower(term int) {
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
-	// Your code here (2C).
+	// Your code here (3C).
 	// Example:
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
@@ -174,7 +174,7 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
+	// Your code here (3C).
 	// Example:
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
@@ -208,14 +208,14 @@ func (rf *Raft) readPersist(data []byte) {
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (2D).
+	// Your code here (3D).
 
 }
 
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
+	// Your data here (3A, 3B).
 	Term         int
 	CandidateId  int
 	LastLogIndex int
@@ -225,14 +225,14 @@ type RequestVoteArgs struct {
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
-	// Your data here (2A).
+	// Your data here (3A).
 	Term        int
 	VoteGranted bool
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
+	// Your code here (3A, 3B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	Debug(dVote, "S%d T:%d -> S%d received vote request from S%d, args: [Term: %d, CandidateId: %d, LastLogIndex: %d, LastLogTerm: %d]", rf.me, rf.currentTerm, rf.me, args.CandidateId, args.Term, args.CandidateId, args.LastLogIndex, args.LastLogTerm)
@@ -395,7 +395,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	isLeader := true
 
-	// Your code here (2B).
+	// Your code here (3B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if rf.role != LEADER {
@@ -498,7 +498,7 @@ func (rf *Raft) elec() {
 func (rf *Raft) ticker() {
 	for !rf.killed() {
 		electionTimeout := 500 + (rand.Int63() % 200)
-		// Your code here (2A)
+		// Your code here (3A)
 		// Check if a leader election should be started.
 		rf.mu.Lock()
 		if rf.role == FOLLOWER && time.Since(rf.lastCommTime) > time.Duration(electionTimeout)*time.Millisecond {
@@ -651,7 +651,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		applyCh:        applyCh,
 	}
 	rf.logs[0] = LogEntry{Term: 0, Command: nil}
-	// Your initialization code here (2A, 2B, 2C).
+	// Your initialization code here (3A, 3B, 3C).
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
