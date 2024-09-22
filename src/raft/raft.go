@@ -162,7 +162,7 @@ func (rf *Raft) persist() {
 	e.Encode(rf.votedFor)
 	e.Encode(rf.logs)
 	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
+	rf.persister.Save(raftstate, rf.persister.ReadSnapshot())
 	Debug(dPersist, "S%d T:%d -> S%d: persist", rf.me, rf.currentTerm, rf.me)
 }
 
@@ -196,6 +196,8 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.logs = logs
+		rf.lastApplied = rf.logs[0].Index
+		rf.commitIndex = rf.logs[0].Index
 	}
 	Debug(dPersist, "S%d T:%d -> S%d: readPersist: currentTerm: %d, votedFor: %d, len(logs): %d", rf.me, rf.currentTerm, rf.me, rf.currentTerm, votedFor, len(logs))
 }
@@ -227,6 +229,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	e.Encode(rf.logs)
 	raftstate := w.Bytes()
 	rf.persister.Save(raftstate, snapshot)
+	Debug(dPersist, "S%d T:%d -> S%d: Snapshot, index: %d, lastIncludedTerm: %d, len(logs): %d, len(snapshot): %d, currentSnapshotSize: %d", rf.me, rf.currentTerm, rf.me, index, lastIncludedTerm, len(rf.logs), len(snapshot), rf.persister.SnapshotSize())
 }
 
 // example RequestVote RPC arguments structure.
@@ -395,6 +398,67 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	Debug(dInfo, "S%d T:%d -> S%d received InstallSnapshot from S%d, args: [Term: %d, LeaderId: %d, LastIncludedIndex: %d, LastIncludedTerm: %d, DataLen: %d]", rf.me, rf.currentTerm, rf.me, args.LeaderId, args.Term, args.LeaderId, args.LastIncludedIndex, args.LastIncludedTerm, len(args.Data))
+	reply.Term = rf.currentTerm
+	if args.Term < rf.currentTerm {
+		return
+	} else if args.Term > rf.currentTerm {
+		rf.becomeFollower(args.Term)
+	}
+	rf.lastCommTime = time.Now()
+	Debug(dTimer, "S%d T:%d -> S%d reset lastCommTime", rf.me, rf.currentTerm, rf.me)
+	if args.LastIncludedIndex <= rf.commitIndex {
+		return
+	} else if args.LastIncludedIndex >= rf.getLastLogEntry().Index {
+		// discard log entries
+		rf.logs = []LogEntry{{Index: args.LastIncludedIndex, Term: args.LastIncludedTerm, Command: nil}}
+	} else {
+		rf.logs = rf.logs[args.LastIncludedIndex-rf.logs[0].Index:]
+		rf.logs[0] = LogEntry{Index: args.LastIncludedIndex, Term: args.LastIncludedTerm, Command: nil}
+	}
+
+	rf.commitIndex = args.LastIncludedIndex
+	rf.lastApplied = args.LastIncludedIndex
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, args.Data)
+	applyMsg := ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      args.Data,
+		SnapshotTerm:  args.LastIncludedTerm,
+		SnapshotIndex: args.LastIncludedIndex,
+	}
+	rf.mu.Unlock()
+	rf.applyCh <- applyMsg
+	rf.mu.Lock()
+	Debug(dCommit, "S%d T:%d -> S%d updates commitIndex from %d to %d", rf.me, rf.commitIndex, rf.me, rf.commitIndex, args.LastIncludedIndex)
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
+
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -537,17 +601,23 @@ func (rf *Raft) ticker() {
 func (rf *Raft) applyer() {
 	for !rf.killed() {
 		rf.mu.Lock()
-		for i:=rf.lastApplied+1; i<=rf.commitIndex; i = rf.lastApplied+1 {
+		entries := make([]LogEntry, rf.commitIndex-rf.lastApplied)
+		Debug(dCommit, "S%d T:%d -> S%d applyer, lastApplied: %d, commitIndex: %d, lastIncludedIndex: %d", rf.me, rf.currentTerm, rf.me, rf.lastApplied, rf.commitIndex, rf.logs[0].Index)
+		copy(entries, rf.logs[rf.lastApplied+1-rf.logs[0].Index:rf.commitIndex+1-rf.logs[0].Index])
+		rf.mu.Unlock()
+		for _, entry := range entries {
 			// apply log[rf.lastApplied] to state machine
-			applyMsg := ApplyMsg{CommandValid: true, Command: rf.logs[i-rf.logs[0].Index].Command, CommandIndex: i}
-			rf.mu.Unlock()
-			rf.applyCh <- applyMsg
-			rf.mu.Lock()
-			Debug(dInfo, "S%d T:%d -> S%d apply log[%d]: %v", rf.me, rf.currentTerm, rf.me, i, rf.logs[i-rf.logs[0].Index].Command)
-			if rf.lastApplied < i {
-				rf.lastApplied = i
+			applyMsg := ApplyMsg{
+				CommandValid: true, 
+				Command: entry.Command,
+				CommandIndex: entry.Index,
 			}
+			rf.applyCh <- applyMsg
+			
+			// Debug(dInfo, "S%d T:%d -> S%d apply log[%d]: %v", rf.me, rf.currentTerm, rf.me, , rf.logs[i-rf.logs[0].Index].Command)
 		}
+		rf.mu.Lock()
+		rf.lastApplied = max(rf.commitIndex, rf.lastApplied)
 		rf.mu.Unlock()
 		time.Sleep(200 * time.Millisecond)
 	}
@@ -572,69 +642,96 @@ func (rf *Raft) heartBeat() {
 			if i != rf.me && rf.role == LEADER {
 				go func(server int, currentTerm int, leaderId int, leaderCommit int) {
 					rf.mu.Lock()
-					args := &AppendEntriesArgs{
-						Term:         currentTerm,
-						LeaderId:     leaderId,
-						PrevLogIndex: rf.nextIndex[server] - 1,
-						PrevLogTerm:  rf.logs[rf.nextIndex[server]-1-rf.logs[0].Index].Term,
-						LeaderCommit: leaderCommit,
-					}
-					if rf.nextIndex[server] <= rf.getLastLogEntry().Index {
-						args.Entries = make([]LogEntry, len(rf.logs[rf.nextIndex[server]-rf.logs[0].Index:]))
-						copy(args.Entries, rf.logs[rf.nextIndex[server]-rf.logs[0].Index:])
-					} else {
-						args.Entries = nil
-					}
-					rf.mu.Unlock()
-					reply := &AppendEntriesReply{}
-					if rf.sendAppendEntries(server, args, reply) {
-						rf.mu.Lock()
-						Debug(dLog, "S%d T:%d -> S%d received appendEntries reply from S%d, reply: [Term: %d, Success: %t, XTerm: %d, XIndex: %d, Xlen: %d]", rf.me, rf.currentTerm, rf.me, server, reply.Term, reply.Success, reply.XTerm, reply.XIndex, reply.Xlen)
-						if reply.Term > rf.currentTerm {
-							rf.becomeFollower(reply.Term)
-						} else if rf.role == LEADER && rf.currentTerm == args.Term && reply.Term == args.Term {
-							if reply.Success {
-								// update nextIndex and matchIndex for follower
-								rf.matchIndex[server] = max(args.PrevLogIndex+len(args.Entries), rf.matchIndex[server])
-								rf.nextIndex[server] = rf.matchIndex[server] + 1
-
-								// If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N
-								N := rf.commitIndex
-								for i := rf.commitIndex + 1; i <= rf.getLastLogEntry().Index; i++ {
-									count := 1
-									for j := 0; j < len(rf.peers); j++ {
-										if j != rf.me && rf.matchIndex[j] >= i {
-											count++
-										}
-									}
-									if count > len(rf.peers)/2 && rf.logs[i-rf.logs[0].Index].Term == rf.currentTerm {
-										N = i
-									}
-								}
-								if N > rf.commitIndex {
-									Debug(dCommit, "S%d T:%d -> S%d(leader) updates commitIndex from %d to %d", rf.me, rf.commitIndex, rf.me, rf.commitIndex, N)
-									rf.commitIndex = N
-								}
-							} else if reply.Xlen > 0 {
-								if reply.XTerm == -1 {
-									// follower's log is too short
-									rf.nextIndex[server] = reply.Xlen
-								} else if rf.logs[reply.XIndex-rf.logs[0].Index].Term == reply.XTerm {
-									// leader has XTerm in its log, find the last index of XTerm
-									for i := reply.XIndex + 1; i <= rf.getLastLogEntry().Index; i++ {
-										if rf.logs[i-rf.logs[0].Index].Term != reply.XTerm {
-											rf.nextIndex[server] = i - 1
-											break
-										}
-									}
+					if rf.nextIndex[server]-1 < rf.logs[0].Index {
+						args := &InstallSnapshotArgs{
+							Term:              currentTerm,
+							LeaderId:          leaderId,
+							LastIncludedIndex: rf.logs[0].Index,
+							LastIncludedTerm:  rf.logs[0].Term,
+							Data:              rf.persister.ReadSnapshot(),
+						}
+						reply := &InstallSnapshotReply{}
+						Debug(dLog, "S%d T:%d -> S%d snapshotSize: %d", rf.me, rf.currentTerm, rf.me, rf.persister.SnapshotSize())
+						Debug(dLog, "S%d T:%d -> S%d send InstallSnapshot to S%d, args: [Term: %d, LeaderId: %d, LastIncludedIndex: %d, LastIncludedTerm: %d, DataLen: %d]", rf.me, rf.currentTerm, rf.me, server, args.Term, args.LeaderId, args.LastIncludedIndex, args.LastIncludedTerm, len(args.Data))
+						rf.mu.Unlock()
+						if rf.sendInstallSnapshot(server, args, reply) {
+							rf.mu.Lock()
+							if rf.role == LEADER && rf.currentTerm == args.Term {
+								Debug(dLog, "S%d T:%d -> S%d received InstallSnapshot reply from S%d, reply: [Term: %d]", rf.me, rf.currentTerm, rf.me, server, reply.Term)
+								if reply.Term > rf.currentTerm {
+									rf.becomeFollower(reply.Term)
 								} else {
-									// leader doesn't have XTerm in its log
-									rf.nextIndex[server] = reply.XIndex
+									rf.nextIndex[server] = args.LastIncludedIndex + 1
+									rf.matchIndex[server] = args.LastIncludedIndex
 								}
-								// rf.nextIndex[server] = args.PrevLogIndex
 							}
+							rf.mu.Unlock()
+						}
+					} else {
+						args := &AppendEntriesArgs{
+							Term:         currentTerm,
+							LeaderId:     leaderId,
+							PrevLogIndex: rf.nextIndex[server] - 1,
+							PrevLogTerm:  rf.logs[rf.nextIndex[server]-1-rf.logs[0].Index].Term,
+							LeaderCommit: leaderCommit,
+						}
+						if rf.nextIndex[server] <= rf.getLastLogEntry().Index {
+							args.Entries = make([]LogEntry, len(rf.logs[rf.nextIndex[server]-rf.logs[0].Index:]))
+							copy(args.Entries, rf.logs[rf.nextIndex[server]-rf.logs[0].Index:])
+						} else {
+							args.Entries = nil
 						}
 						rf.mu.Unlock()
+						reply := &AppendEntriesReply{}
+						if rf.sendAppendEntries(server, args, reply) {
+							rf.mu.Lock()
+							Debug(dLog, "S%d T:%d -> S%d received appendEntries reply from S%d, reply: [Term: %d, Success: %t, XTerm: %d, XIndex: %d, Xlen: %d]", rf.me, rf.currentTerm, rf.me, server, reply.Term, reply.Success, reply.XTerm, reply.XIndex, reply.Xlen)
+							if reply.Term > rf.currentTerm {
+								rf.becomeFollower(reply.Term)
+							} else if rf.role == LEADER && rf.currentTerm == args.Term && reply.Term == args.Term {
+								if reply.Success {
+									// update nextIndex and matchIndex for follower
+									rf.matchIndex[server] = max(args.PrevLogIndex+len(args.Entries), rf.matchIndex[server])
+									rf.nextIndex[server] = rf.matchIndex[server] + 1
+
+									// If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N
+									N := rf.commitIndex
+									for i := rf.commitIndex + 1; i <= rf.getLastLogEntry().Index; i++ {
+										count := 1
+										for j := 0; j < len(rf.peers); j++ {
+											if j != rf.me && rf.matchIndex[j] >= i {
+												count++
+											}
+										}
+										if count > len(rf.peers)/2 && rf.logs[i-rf.logs[0].Index].Term == rf.currentTerm {
+											N = i
+										}
+									}
+									if N > rf.commitIndex {
+										Debug(dCommit, "S%d T:%d -> S%d(leader) updates commitIndex from %d to %d", rf.me, rf.commitIndex, rf.me, rf.commitIndex, N)
+										rf.commitIndex = N
+									}
+								} else if reply.Xlen > 0 {
+									if reply.XTerm == -1 {
+										// follower's log is too short
+										rf.nextIndex[server] = reply.Xlen
+									} else if rf.logs[reply.XIndex-rf.logs[0].Index].Term == reply.XTerm {
+										// leader has XTerm in its log, find the last index of XTerm
+										for i := reply.XIndex + 1; i <= rf.getLastLogEntry().Index; i++ {
+											if rf.logs[i-rf.logs[0].Index].Term != reply.XTerm {
+												rf.nextIndex[server] = i - 1
+												break
+											}
+										}
+									} else {
+										// leader doesn't have XTerm in its log
+										rf.nextIndex[server] = reply.XIndex
+									}
+									// rf.nextIndex[server] = args.PrevLogIndex
+								}
+							}
+							rf.mu.Unlock()
+						}
 					}
 				}(i, currentTerm, leaderId, leaderCommit)
 			}
