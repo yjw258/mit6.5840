@@ -346,7 +346,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.lastCommTime = time.Now()
 	Debug(dTimer, "S%d T:%d -> S%d reset lastCommTime", rf.me, rf.currentTerm, rf.me)
 
-	if args.PrevLogIndex > rf.getLastLogEntry().Index {
+	if args.PrevLogIndex > rf.getLastLogEntry().Index || args.PrevLogIndex < rf.logs[0].Index {
 		reply.Success = false
 		reply.Xlen = rf.getLastLogEntry().Index + 1
 		return
@@ -598,26 +598,21 @@ func (rf *Raft) ticker() {
 }
 
 // apply log entries to state machine
-func (rf *Raft) applyer() {
+func (rf *Raft) applier() {
 	for !rf.killed() {
 		rf.mu.Lock()
-		entries := make([]LogEntry, rf.commitIndex-rf.lastApplied)
-		Debug(dCommit, "S%d T:%d -> S%d applyer, lastApplied: %d, commitIndex: %d, lastIncludedIndex: %d", rf.me, rf.currentTerm, rf.me, rf.lastApplied, rf.commitIndex, rf.logs[0].Index)
-		copy(entries, rf.logs[rf.lastApplied+1-rf.logs[0].Index:rf.commitIndex+1-rf.logs[0].Index])
-		rf.mu.Unlock()
-		for _, entry := range entries {
-			// apply log[rf.lastApplied] to state machine
+		for rf.lastApplied < rf.commitIndex {
+			lastAppliedIndex := rf.lastApplied
 			applyMsg := ApplyMsg{
-				CommandValid: true, 
-				Command: entry.Command,
-				CommandIndex: entry.Index,
+				CommandValid: true,
+				Command:      rf.logs[lastAppliedIndex+1-rf.logs[0].Index].Command,
+				CommandIndex: rf.logs[lastAppliedIndex+1-rf.logs[0].Index].Index,
 			}
+			rf.mu.Unlock()
 			rf.applyCh <- applyMsg
-			
-			// Debug(dInfo, "S%d T:%d -> S%d apply log[%d]: %v", rf.me, rf.currentTerm, rf.me, , rf.logs[i-rf.logs[0].Index].Command)
+			rf.mu.Lock()
+			rf.lastApplied = max(rf.lastApplied, lastAppliedIndex+1)
 		}
-		rf.mu.Lock()
-		rf.lastApplied = max(rf.commitIndex, rf.lastApplied)
 		rf.mu.Unlock()
 		time.Sleep(200 * time.Millisecond)
 	}
@@ -779,7 +774,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.ticker()
 
 	// start commiter goroutine to commit log entries
-	go rf.applyer()
+	go rf.applier()
 
 	return rf
 }
