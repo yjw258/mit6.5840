@@ -710,6 +710,8 @@ func (rf *Raft) heartBeat() {
 									if reply.XTerm == -1 {
 										// follower's log is too short
 										rf.nextIndex[server] = reply.Xlen
+									} else if reply.XIndex-rf.logs[0].Index < 0{
+										rf.nextIndex[server] = rf.logs[0].Index
 									} else if rf.logs[reply.XIndex-rf.logs[0].Index].Term == reply.XTerm {
 										// leader has XTerm in its log, find the last index of XTerm
 										for i := reply.XIndex + 1; i <= rf.getLastLogEntry().Index; i++ {
